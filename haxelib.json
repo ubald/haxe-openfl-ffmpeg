@@ -7,6 +7,7 @@
   "releasenote": "First release linked to ffmpeg 2.1.1",
   "version": "0.0.1",
   "url": "https://github.com/soywiz/haxe-openfl-ffmpeg",
+  "classPath": "src",
   "dependencies": {
     "openfl": "",
     "hxcpp": ""

@@ -1,6 +1,5 @@
 /project/obj
-
 /project/*.pdb
 /project/all_objs
-
-/libs.src/a.exe
+/libs/*
+/ndll/*

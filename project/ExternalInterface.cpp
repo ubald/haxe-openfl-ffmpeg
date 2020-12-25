@@ -6,286 +6,146 @@
 #define IMPLEMENT_API
 #endif
 
+#include <iostream>
 #include <hx/CFFI.h>
-//#include <hx/CFFIAPI.h>
-
-#define DEFINE_FUNC(COUNT, NAME, ...) value NAME(__VA_ARGS__); DEFINE_PRIM(NAME, COUNT); value NAME(__VA_ARGS__)
-#define DEFINE_FUNC_0(NAME) DEFINE_FUNC(0, NAME)
-#define DEFINE_FUNC_1(NAME, PARAM1) DEFINE_FUNC(1, NAME, value PARAM1)
-#define DEFINE_FUNC_2(NAME, PARAM1, PARAM2) DEFINE_FUNC(2, NAME, value PARAM1, value PARAM2)
-#define DEFINE_FUNC_3(NAME, PARAM1, PARAM2, PARAM3) DEFINE_FUNC(3, NAME, value PARAM1, value PARAM2, value PARAM3)
-#define DEFINE_FUNC_4(NAME, PARAM1, PARAM2, PARAM3, PARAM4) DEFINE_FUNC(4, NAME, value PARAM1, value PARAM2, value PARAM3, value PARAM4)
-#define DEFINE_FUNC_5(NAME, PARAM1, PARAM2, PARAM3, PARAM4, PARAM5) DEFINE_FUNC(5, NAME, value PARAM1, value PARAM2, value PARAM3, value PARAM4, value PARAM5)
-
 
 extern "C" {
-	#include <libavcodec/avcodec.h>
+	#include <libavutil/avutil.h>
 	#include <libavformat/avformat.h>
-	#include <libswscale/swscale.h>
 	#include <libswresample/swresample.h>
+	#include <libswscale/swscale.h>
 }
 
-#include <stdio.h>
+void out(const AVCodecContext* codecContext, const AVFrame* frame, value callback) {
+	int in_nchannels = codecContext->channels;
+	int in_nsamples = frame->nb_samples;
+	AVSampleFormat in_sample_format = codecContext->sample_fmt;
+	int in_channel_layout = codecContext->channel_layout;
 
-static int initialized = 0;
+	SwrContext *swr = swr_alloc_set_opts(
+		NULL,
+		AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_FLT, 44100,
+		codecContext->channel_layout, codecContext->sample_fmt, codecContext->sample_rate,
+		0, NULL
+	);
 
-void __check_init() 
-{
-	if (!initialized)
-	{
-		initialized = 1;
-		av_register_all();
-	}
+	swr_init(swr);
+	//int in_size = av_samples_get_buffer_size(NULL, in_nchannels, in_nsamples, in_sample_format, 1);
+	int out_size = av_samples_get_buffer_size(NULL, in_nchannels, in_nsamples, AV_SAMPLE_FMT_FLT, 1);
+	buffer out_buffer = alloc_buffer_len(out_size);
+	uint8_t *out = (uint8_t *)buffer_data(out_buffer);
+	swr_convert(swr, &out, in_nsamples, (const uint8_t **)frame->data, in_nsamples);
+	swr_free(&swr);
+	val_call1(callback, buffer_val(out_buffer));
 }
 
-typedef struct {
-	AVFormatContext *pFormatCtx;
-	
-	AVCodecContext  *videoCodecContext;
-	AVCodec         *videoCodec;
-	AVDictionary    *videoOptionsDict;
-	
-	AVCodecContext  *audioCodecContext;
-	AVCodec         *audioCodec;
-	AVDictionary    *audioOptionsDict;
+int __ffmpeg_read_file( const char *name, value callback ) {
+	// Initialize FFmpeg
+    av_register_all();
 
-	AVFrame         *pFrame;
-	AVFrame         *pFrameRGB;
-	uint8_t         *buffer;
-	int videoStream;
-	int audioStream;
-	
-	struct SwsContext      *sws_ctx;
-	int numBytes;
-} FfmpegContext;
+    AVFrame* frame = av_frame_alloc();
+    if (!frame)
+    {
+        std::cout << "Error allocating the frame" << std::endl;
+        return 1;
+    }
 
-FfmpegContext ffmpeg_context = {0};
+    // you can change the file name "01 Push Me to the Floor.wav" to whatever the file is you're reading, like "myFile.ogg" or
+    // "someFile.webm" and this should still work
+    AVFormatContext* formatContext = NULL;
+    if (avformat_open_input(&formatContext, name, NULL, NULL) != 0)
+    {
+        av_free(frame);
+        std::cout << "Error opening the file" << std::endl;
+        return 1;
+    }
 
-#define   USED_PIX_FMT   AV_PIX_FMT_ARGB
+    if (avformat_find_stream_info(formatContext, NULL) < 0)
+    {
+        av_free(frame);
+        avformat_close_input(&formatContext);
+        std::cout << "Error finding the stream info" << std::endl;
+        return 1;
+    }
 
-int __ffmpeg_open_file(FfmpegContext *context, const char *name)
-{
-	if (avformat_open_input(&context->pFormatCtx, name, NULL, NULL)!=0) return -1; // Couldn't open file
-	
-	if(avformat_find_stream_info(context->pFormatCtx, NULL)<0) return -2; // Couldn't find stream information
+    // Find the audio stream
+    AVCodec* cdc = 0;
+    int streamIndex = av_find_best_stream(formatContext, AVMEDIA_TYPE_AUDIO, -1, -1, &cdc, 0);
+    if (streamIndex < 0)
+    {
+        av_free(frame);
+        avformat_close_input(&formatContext);
+        std::cout << "Could not find any audio stream in the file" << std::endl;
+        return 1;
+    }
 
-	av_dump_format(context->pFormatCtx, 0, name, 0);
-	
-	context->videoStream=-1;
-	context->audioStream=-1;
-	for(int i=0; i<context->pFormatCtx->nb_streams; i++)
-	{
-		if(context->pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
-			if (context->videoStream < 0) context->videoStream=i;
-		}
+    AVStream* audioStream = formatContext->streams[streamIndex];
+    AVCodecContext* codecContext = audioStream->codec;
+    codecContext->codec = cdc;
 
-		if(context->pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_AUDIO) {
-			if (context->audioStream < 0) context->audioStream=i;
-		}
-	}
-	
-	if (context->videoStream == -1) return -1; // Didn't find a video stream
-	if (context->audioStream == -1) return -1; // Didn't find a video stream
-	
-	context->videoCodecContext = context->pFormatCtx->streams[context->videoStream]->codec;
-	context->videoCodec=avcodec_find_decoder(context->videoCodecContext->codec_id);
-	if (context->videoCodec==NULL) return -3; // Codec not found
-	if (avcodec_open2(context->videoCodecContext, context->videoCodec, &context->videoOptionsDict)<0) return -4; // Could not open codec
-	
-	context->audioCodecContext = context->pFormatCtx->streams[context->audioStream]->codec;
-	context->audioCodec = avcodec_find_decoder(context->audioCodecContext->codec_id);
-	if (context->audioCodec==NULL) return -3; // Codec not found
-	if (avcodec_open2(context->audioCodecContext, context->audioCodec, &context->audioOptionsDict)<0) return -4; // Could not open codec
-	
-	
-	// Allocate video frame
-	// Allocate an AVFrame structure
-	context->pFrame = avcodec_alloc_frame();
-	context->pFrameRGB = avcodec_alloc_frame();
-	
-	// Determine required buffer size and allocate buffer
-	context->numBytes = avpicture_get_size(USED_PIX_FMT, context->videoCodecContext->width, context->videoCodecContext->height);
-	context->buffer = (uint8_t *)av_malloc(context->numBytes*sizeof(uint8_t));
+    if (avcodec_open2(codecContext, codecContext->codec, NULL) != 0)
+    {
+        av_free(frame);
+        avformat_close_input(&formatContext);
+        std::cout << "Couldn't open the context with the decoder" << std::endl;
+        return 1;
+    }
 
-	context->sws_ctx = sws_getContext(context->videoCodecContext->width, context->videoCodecContext->height, context->videoCodecContext->pix_fmt, context->videoCodecContext->width, context->videoCodecContext->height, USED_PIX_FMT, SWS_BILINEAR, NULL, NULL, NULL);
+    std::cout << "This stream has " << codecContext->channels << " channels and a sample rate of " << codecContext->sample_rate << "Hz" << std::endl;
+    std::cout << "The data is in the format " << av_get_sample_fmt_name(codecContext->sample_fmt) << std::endl;
 
-	// Assign appropriate parts of buffer to image planes in pFrameRGB
-	// Note that pFrameRGB is an AVFrame, but AVFrame is a superset
-	// of AVPicture
-	avpicture_fill((AVPicture *)context->pFrameRGB, context->buffer, USED_PIX_FMT, context->videoCodecContext->width, context->videoCodecContext->height);
+    AVPacket readingPacket;
+    av_init_packet(&readingPacket);
 
-	return 0;
+    // Read the packets in a loop
+    while (av_read_frame(formatContext, &readingPacket) == 0) {
+        if (readingPacket.stream_index == audioStream->index) {
+            AVPacket decodingPacket = readingPacket;
+
+            // Audio packets can have multiple audio frames in a single packet
+            while (decodingPacket.size > 0) {
+                // Try to decode the packet into a frame
+                // Some frames rely on multiple packets, so we have to make sure the frame is finished before
+                // we can use it
+                int gotFrame = 0;
+                int result = avcodec_decode_audio4(codecContext, frame, &gotFrame, &decodingPacket);
+
+                if (result >= 0 && gotFrame) {
+                    decodingPacket.size -= result;
+                    decodingPacket.data += result;
+					out(codecContext, frame, callback);
+                } else {
+                    decodingPacket.size = 0;
+                    decodingPacket.data = 0;
+                }
+            }
+        }
+
+        // You *must* call av_free_packet() after each call to av_read_frame() or else you'll leak memory
+        av_free_packet(&readingPacket);
+    }
+
+    // Some codecs will cause frames to be buffered up in the decoding process. If the CODEC_CAP_DELAY flag
+    // is set, there can be buffered up frames that need to be flushed, so we'll do that
+    if (codecContext->codec->capabilities & CODEC_CAP_DELAY) {
+        av_init_packet(&readingPacket);
+        // Decode all the remaining frames in the buffer, until the end is reached
+        int gotFrame = 0;
+        while (avcodec_decode_audio4(codecContext, frame, &gotFrame, &readingPacket) >= 0 && gotFrame) {
+            out(codecContext, frame, callback);
+        }
+    }
+
+    // Clean up!
+    av_free(frame);
+    avcodec_close(codecContext);
+    avformat_close_input(&formatContext);
+
+    return 0;
 }
 
-void __fmpeg_close_file(FfmpegContext *context)
-{
-	// Free the RGB image
-	av_free(context->buffer);
-	av_free(context->pFrameRGB);
-
-	// Free the YUV frame
-	av_free(context->pFrame);
-
-	// Close the codec
-	avcodec_close(context->videoCodecContext);
-
-	// Close the video file
-	avformat_close_input(&context->pFormatCtx);
-}
-
-void __fmpeg_copy_frame_to_pointer(AVFrame *pFrame, int width, int height, char *output_ptr, int output_len)
-{
-	char *current_output_ptr = output_ptr;
-	for (int y = 0; y < height; y++)
-	{
-		int copyCount = width * 4;
-		memcpy(current_output_ptr, pFrame->data[0]+y*pFrame->linesize[0], copyCount);
-		current_output_ptr += copyCount;
-	}
-}
-
-int __fmpeg_decode_frame(FfmpegContext *context, char *output_ptr, int output_len, value emit_sound_callback)
-{
-	AVPacket        packet;
-	int frameFinished;
-	int generated_frame = 0;
-	while(av_read_frame(context->pFormatCtx, &packet)>=0)
-	{
-		// Is this a packet from the video stream?
-		if (packet.stream_index==context->videoStream) {
-			// Decode video frame
-			avcodec_decode_video2(context->videoCodecContext, context->pFrame, &frameFinished, &packet);
-
-			// Did we get a video frame?
-			if (frameFinished) {
-				// Convert the image from its native format to RGB
-				sws_scale(
-					context->sws_ctx,
-					(uint8_t const * const *)context->pFrame->data,
-					context->pFrame->linesize,
-					0,
-					context->videoCodecContext->height,
-					context->pFrameRGB->data,
-					context->pFrameRGB->linesize
-				);
-
-				__fmpeg_copy_frame_to_pointer(context->pFrameRGB, context->videoCodecContext->width, context->videoCodecContext->height, output_ptr, output_len);
-				generated_frame = 1;
-			}
-		}
-		else if (packet.stream_index == context->audioStream) {
-			static AVFrame audioFrame;
-			int got_frame = 0;
-			int len1 = avcodec_decode_audio4(context->audioCodecContext, &audioFrame, &got_frame, &packet);
-        
-			if (got_frame)
-			{
-			
-				// frame_size
-				
-				//printf("%d, %d, %d\n", context->audioCodecContext->sample_rate, context->audioCodecContext->channels, context->audioCodecContext->sample_fmt);
-        
-				int in_nchannels = context->audioCodecContext->channels;
-				int in_nsamples = audioFrame.nb_samples;
-				AVSampleFormat in_sample_format = context->audioCodecContext->sample_fmt;
-				int in_channel_layout = context->audioCodecContext->channel_layout;
-				
-				/*
-				int in_size = av_samples_get_buffer_size(NULL, in_nchannels, in_nsamples, in_sample_format, 1);
-				int out_size = in_size / in_nchannels;
-				
-				value array = alloc_array(0);
-				for (int n = 0; n < in_nchannels; n++) {
-					buffer out_buffer = alloc_buffer_len(out_size);
-					memcpy((uint8_t *)buffer_data(out_buffer), audioFrame.data[n], out_size);
-					val_array_push(array, buffer_val(out_buffer));
-				}
-				val_call1(emit_sound_callback, array);
-				*/
-
-				{
-					SwrContext *swr = swr_alloc_set_opts(
-						NULL,
-						AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_FLT, 44100,
-						context->audioCodecContext->channel_layout, context->audioCodecContext->sample_fmt, context->audioCodecContext->sample_rate,
-						//context->audioCodecContext->channel_layout, frame.format, frame.sample_rate,
-						0, NULL
-					);
-					
-					swr_init(swr);
-			
-					int in_size = av_samples_get_buffer_size(NULL, in_nchannels, in_nsamples, in_sample_format, 1);
-					int out_size = av_samples_get_buffer_size(NULL, in_nchannels, in_nsamples, AV_SAMPLE_FMT_FLT, 1);
-					
-					buffer out_buffer = alloc_buffer_len(out_size);
-					
-					uint8_t *out = (uint8_t *)buffer_data(out_buffer);
-					
-					//const uint8_t *in = (uint8_t *)audioFrame.data[0];
-					
-					swr_convert(swr, &out, in_nsamples, (const uint8_t **)audioFrame.data, in_nsamples);
-					
-					swr_free(&swr);
-					
-					val_call1(emit_sound_callback, buffer_val(out_buffer));
-				}
-        
-			}
-		}
-		av_free_packet(&packet);
-		if (generated_frame) return 0;
-	}
-	return 1;
-}
-
-DEFINE_FUNC_0(hx_ffmpeg_get_version)
-{
-	__check_init();
-	return alloc_string("2.1.1");
-}
-
-
-DEFINE_FUNC_1(hx_ffmpeg_open_file, file_name)
-{
-	__check_init();
-	__ffmpeg_open_file(&ffmpeg_context, val_get_string(file_name));
+value hx_ffmpeg_read_file( value file_name, value callback ) {
+	__ffmpeg_read_file(val_get_string(file_name), callback);
 	return alloc_null();
 }
-
-DEFINE_FUNC_0(hx_ffmpeg_get_width)
-{
-	__check_init();
-	return alloc_int(ffmpeg_context.videoCodecContext->width);
-}
-
-DEFINE_FUNC_0(hx_ffmpeg_get_height)
-{
-	__check_init();
-	return alloc_int(ffmpeg_context.videoCodecContext->height);
-}
-
-DEFINE_FUNC_2(hx_ffmpeg_decode_frame, data_buffer_value, emit_sound_callback)
-{
-	__check_init();
-	
-	if (!val_is_buffer(data_buffer_value)) {
-		val_throw(alloc_string("Expected to be a buffer"));
-		return alloc_null();
-	}
-	
-	buffer data_buffer = val_to_buffer(data_buffer_value);
-	char *data_buffer_ptr = buffer_data(data_buffer);
-	int data_buffer_len = buffer_size(data_buffer);
-	
-	return alloc_int(__fmpeg_decode_frame(&ffmpeg_context, data_buffer_ptr, data_buffer_len, emit_sound_callback));
-}
-
-DEFINE_FUNC_0(hx_ffmpeg_close_file)
-{
-	__check_init();
-	__fmpeg_close_file(&ffmpeg_context);
-	//value vv;
-	//val_call1(vv);
-	return alloc_null();
-}
-
+DEFINE_PRIM(hx_ffmpeg_read_file,2)

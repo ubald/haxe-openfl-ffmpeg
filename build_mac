@@ -1,3 +1,0 @@
-pushd project
-haxelib run hxcpp Build.xml -Dmac
-popd
